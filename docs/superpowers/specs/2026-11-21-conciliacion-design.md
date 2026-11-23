@@ -1,12 +1,12 @@
 # Conciliación — Albaranes, facturas y pagos de proveedores
 
 **Fecha:** 2026-11-21
-**Estado:** Borrador para revisión de Guido
+**Estado:** Revisado por Guido (23/11/2026), para revisión de Agustín
 **Origen funcional:** "261121_Natif_Especificación funcional Conciliación_In" (claude.ai)
 
 ## 1. Objetivo y alcance
 
-Conciliación es una app web que cruza **cada albarán con su factura y cada factura con su pago**, y muestra las diferencias en euros por proveedor y por local. El primer cliente es Natif Coffee SL (Madrid). La única tarea del cliente es fotografiar los albaranes desde una tablet. Basal opera el resto: revisa lo dudoso, completa maestros, resuelve incidencias y prepara reclamos.
+Conciliación es una app web que registra **todas las facturas que recibe la empresa**, cruza **cada factura con su pago** y, donde hay albarán, **cada albarán con su factura línea a línea**. Muestra las diferencias en euros por proveedor y por local. Cubre las compras de mercadería (con albarán) y también alquiler, servicios profesionales, suministros y obras (sin albarán: solo factura ↔ pago). El primer cliente es Natif Coffee SL (Madrid), donde el local solo fotografía los albaranes desde una tablet.
 
 Se construye **como app independiente para probarla**. Después se integra a `basal-erp` como un módulo más. Por eso usa **el mismo stack y las mismas reglas que basal-erp** (§3): integrar es mover código y mapear tablas, no reescribir.
 
@@ -15,8 +15,9 @@ Se construye **como app independiente para probarla**. Después se integra a `ba
 - Captura de albaranes, facturas y tickets desde la tablet de cada local.
 - Lectura con IA (API de Claude), validación y bandeja de revisión.
 - Importación del extracto de Santander (Excel).
-- Cruce factura ↔ pago y cruce albarán ↔ factura línea a línea.
-- Incidencias y reclamos con aprobación del Dueño.
+- Todas las facturas recibidas, con retenciones de IRPF cuando las llevan.
+- Cruce factura ↔ pago para todas, y cruce albarán ↔ factura línea a línea donde hay albarán.
+- Incidencias y reclamos con aprobación de un usuario con permiso `incidents_approve`.
 - Vistas: inicio, documentos, revisión, cruces, pagos, incidencias, proveedores.
 - Alerta de subida de precio contra la compra anterior.
 - Lectura automática de facturas del buzón info@natif.es (GoDaddy, IMAP, solo lectura).
@@ -28,7 +29,7 @@ Se construye **como app independiente para probarla**. Después se integra a `ba
 1. **Ninguna factura con diferencia figura como conciliada.** Toda diferencia es una incidencia con importe hasta que se cierra con abono, corrección o decisión registrada.
 2. **No se inventan datos.** Lo que la IA no lee con confianza va a revisión; nunca se completa una cantidad ni un precio adivinado.
 3. **Los originales no se modifican.** Cada archivo se guarda tal como llegó, identificado por su huella SHA-256, y cada dato conserva el vínculo a su archivo.
-4. **El cliente no carga datos.** Las pantallas del local solo capturan; la edición es de Basal.
+4. **Capturar no exige cargar datos, y editar depende del permiso, no de la empresa.** La tablet solo saca la foto. Revisar, editar, conciliar y aprobar lo puede hacer cualquier usuario que tenga ese permiso asignado, sea del cliente o de Basal.
 5. **Lógica pura y testeable.** Los cruces y validaciones son funciones puras, sin Prisma, como `computeItemCost` y `planFifoConsumption` en el ERP.
 
 ## 3. Stack y lo que se copia de basal-erp
@@ -58,24 +59,36 @@ Se construye **como app independiente para probarla**. Después se integra a `ba
 | Identificación fiscal | CIF/NIF/NIE validados con su dígito de control (`lib/es/nif.ts`, pura). Se guarda normalizado, sin guiones ni espacios y en mayúsculas |
 | IVA | Tipos 0, 4, 10 y 21%, con recargo de equivalencia opcional (0,5 / 1,4 / 5,2%). Base, cuota y recargo se guardan por tipo |
 | Comprobantes | `albaran`, `factura` (completa), `factura_simplificada` (ticket), `abono` (factura rectificativa) |
+| Retenciones de IRPF | Por factura: tipo y cuota. Tipos habituales: 15% profesionales (7% en los primeros años o artistas), 19% arrendamientos, 1% actividades en módulos y ganaderas, 2% agrícolas. Lo que se paga al proveedor es base + IVA + recargo − retención (`payable_total`); la retención la ingresa la empresa en los modelos 111 (profesionales) y 115 (alquileres) |
+| Recargo de equivalencia | Soportado en el modelo, pero la hostelería no está en ese régimen: en Natif no se espera. Si aparece en una factura de Natif, se marca para revisión |
 | Moneda | EUR, una sola moneda por empresa |
 | Formato visible | Punto de miles y coma decimal (`1.234,56 €`), con helpers en `lib/format.ts`. Es el mismo separador que la regla es-AR del ERP; se agrega `formatEuro` |
 | Fechas | DD/MM/AAAA en pantalla e ISO en la base. Zona horaria de la empresa: `Europe/Madrid` |
 
-## 5. Perfiles y permisos
+## 5. Permisos
 
-Perfiles fijos en código (`lib/rbac/roleProfiles.ts`), como en el ERP:
+**Cada usuario tiene asignados permisos concretos.** Para conciliar, revisar o aprobar, el usuario tiene que tener ese permiso en su ficha; no importa si es del cliente o de Basal. Los perfiles son **plantillas** que precargan permisos al crear un usuario, y después se ajustan uno por uno.
 
-| Perfil | Quién en Natif | Permisos |
-|---|---|---|
-| `dueno` | Robbie | Ve todo y aprueba reclamos y diferencias aceptadas. No edita documentos |
-| `consulta` | Juampo | Ve todo y no edita |
-| `operador` | Basal | Todo: revisar, editar, cruzar, gestionar incidencias, importar extractos, maestros, usuarios y configuración |
-| `local` | La tablet de cada local | Solo captura, y ve lo subido por su local en los últimos 7 días |
+Catálogo (`moduleKey = conciliacion`):
 
-Catálogo de permisos (`moduleKey = conciliacion`): `view`, `capture`, `review`, `match`, `incidents`, `incidents_approve`, `bank_import`, `masters`, `settings`, `sensitive` (ver CIF completos y datos bancarios). Cada pantalla y cada acción del servidor verifican el permiso.
+| Permiso | Qué habilita |
+|---|---|
+| `capture` | Subir documentos (tablet). El usuario de captura tiene un local fijo |
+| `view` | Ver documentos, cruces, pagos, proveedores e inicio |
+| `review` | Corregir la lectura en la bandeja y en el detalle del documento |
+| `match` | Confirmar o descartar cruces propuestos y vincular a mano |
+| `bank_import` | Importar extractos |
+| `incidents` | Gestionar incidencias y preparar reclamos |
+| `incidents_approve` | Aprobar reclamos y aceptar diferencias |
+| `masters` | Proveedores, insumos, equivalencias, locales y cuentas bancarias |
+| `settings` | Tolerancias, buzón y usuarios |
+| `sensitive` | Ver NIF completos y datos bancarios |
 
-**Usuario de tablet:** un usuario por local, con el local fijo en su membresía (`tenant_memberships.location_id`). Basal inicia la sesión una sola vez en la tablet, y la sesión dura 180 días.
+Plantillas iniciales: **Captura** (`capture`), **Consulta** (`view`), **Operador** (todo menos `incidents_approve`), **Aprobador** (`view`, `incidents_approve`) y **Administrador** (todo). En el piloto de Natif: la tablet de cada local = Captura, Juampo = Consulta, Robbie = Aprobador y Basal = Operador. Es solo la configuración inicial, no una regla del sistema.
+
+Cada pantalla y cada acción del servidor verifican el permiso. Ocultar un botón no es la única barrera.
+
+**Usuario de captura:** uno por local, con el local fijo en su membresía (`tenant_memberships.location_id`). Lo inicia una vez quien tenga `settings` y la sesión dura 180 días.
 
 ## 6. Modelo de datos
 
@@ -85,7 +98,7 @@ Todas las tablas son de una empresa: llevan `tenant_id`, RLS estándar, `created
 
 **`locations`** (ERP: `locations`): `name`, `kind` (`local` | `central`), `delivery_address`, `active`. En Natif: Kitchen, Bakery, Natif 3 y Estructura central.
 
-**`suppliers`** (ERP: `suppliers`): `legal_name`, `trade_name`, `tax_id` (NIF validado, único por empresa cuando no es null, con índice parcial), `bank_aliases` (text[]: cómo aparece en el extracto, por ejemplo "EUROPATATAS CEN"), `payment_method` (`transferencia` | `domiciliacion` | `tarjeta` | `efectivo` | `mixto`), `payment_term_days`, `has_prepaid_balance` (bool, para el caso Euceco), `category`, `email`, `notes`, `active`.
+**`suppliers`** (ERP: `suppliers`): `legal_name`, `trade_name`, `tax_id` (NIF validado, único por empresa cuando no es null, con índice parcial), `supplier_kind` (`mercaderia` | `servicios` | `alquiler` | `suministros` | `obras_inversion` | `otros`), `uses_delivery_notes` (bool: si manda albaranes; define si aplica el cruce albarán ↔ factura), `default_withholding_rate` (nullable), `bank_aliases` (text[]: cómo aparece en el extracto, por ejemplo "EUROPATATAS CEN"), `payment_method` (`transferencia` | `domiciliacion` | `tarjeta` | `efectivo` | `mixto`), `payment_term_days`, `has_prepaid_balance` (bool, para el caso Euceco), `category`, `email`, `notes`, `active`.
 
 **`supply_items`**, los insumos de Natif (ERP: `items` de tipo insumo): `name`, `base_unit` (clave del catálogo de unidades del ERP: g, kg, ml, l, ud), `category`, `active`. Se cargan del Maestro de Insumos de los escandallos.
 
@@ -95,13 +108,13 @@ Todas las tablas son de una empresa: llevan `tenant_id`, RLS estándar, `created
 
 **`source_files`**: `sha256` (único por empresa), `storage_path`, `mime_type`, `size_bytes`, `page_count`, `origin` (`tablet` | `mail` | `bank_import` | `manual` | `whatsapp`), `location_id` (nullable), `uploaded_by`, `uploaded_at`, `mail_message_id` (nullable), `local_note` (la nota "Llegó con diferencias"), `reported_difference` (bool), `status` (`pendiente_lectura` | `leyendo` | `leido` | `rechazado` | `duplicado`), `reject_reason`, `attempts`. Un archivo puede tener varias páginas y dar uno o más documentos.
 
-**`documents`** (ERP: `purchases`): `source_file_id`, `doc_type` (`albaran` | `factura` | `factura_simplificada` | `abono` | `otro`), `supplier_id` (nullable hasta que se identifica), `supplier_tax_id_read`, `supplier_name_read`, `doc_number`, `doc_date`, `due_date`, `location_id`, `referenced_delivery_numbers` (text[]: los albaranes que cita la factura), `rectifies_document_id` (en un abono), `net_total`, `vat_total`, `surcharge_total`, `total` (Decimal 14,2), `read_confidence` (`alta` | `media` | `baja`), `read_status` (`leido` | `a_revisar` | `revisado` | `rechazado`), `match_status` (`pendiente` | `conciliado` | `con_diferencia` | `falta_albaran` | `revision` | `aceptado_con_diferencia` | `no_aplica`), `payment_status` (`pendiente` | `parcial` | `pagada` | `vencida` | `no_aplica`), `extraction_json` (jsonb: la salida cruda de la IA y la versión del prompt), `prompt_version`. Tiene un índice único parcial en (`tenant_id`, `supplier_id`, `doc_type`, `doc_number`) WHERE `doc_number` IS NOT NULL AND `read_status` <> 'rechazado'.
+**`documents`** (ERP: `purchases`): `source_file_id`, `doc_type` (`albaran` | `factura` | `factura_simplificada` | `abono` | `otro`), `supplier_id` (nullable hasta que se identifica), `supplier_tax_id_read`, `supplier_name_read`, `doc_number`, `doc_date`, `due_date`, `location_id`, `referenced_delivery_numbers` (text[]: los albaranes que cita la factura), `rectifies_document_id` (en un abono), `net_total`, `vat_total`, `surcharge_total`, `total`, `withholding_rate`, `withholding_amount`, `payable_total` (Decimal 14,2; `payable_total` = total − retención), `read_confidence` (`alta` | `media` | `baja`), `read_status` (`leido` | `a_revisar` | `revisado` | `rechazado`), `match_status` (`pendiente` | `conciliado` | `con_diferencia` | `falta_albaran` | `revision` | `aceptado_con_diferencia` | `no_aplica`), `payment_status` (`pendiente` | `parcial` | `pagada` | `vencida` | `no_aplica`), `extraction_json` (jsonb: la salida cruda de la IA y la versión del prompt), `prompt_version`. Tiene un índice único parcial en (`tenant_id`, `supplier_id`, `doc_type`, `doc_number`) WHERE `doc_number` IS NOT NULL AND `read_status` <> 'rechazado'.
 
 **`document_vat_breakdown`**: `document_id`, `vat_rate`, `base`, `vat_amount`, `surcharge_rate`, `surcharge_amount`.
 
 **`document_lines`** (ERP: `purchase_lines`): `document_id`, `line_no`, `supplier_code`, `description`, `quantity`, `unit_label`, `unit_price`, `discount_pct`, `vat_rate`, `line_net` (Decimal), `equivalence_id` (nullable), `supply_item_id` (nullable), `base_quantity` y `unit_price_base` (calculados con la equivalencia), `field_flags` (jsonb: los campos dudosos de la línea).
 
-**`review_items`**, la bandeja de Basal: `kind` (`lectura` | `proveedor_nuevo` | `equivalencia_nueva` | `cruce_propuesto` | `pago_propuesto`), `document_id` / `bank_movement_id` / `match_id` (los que apliquen), `reason`, `status` (`abierto` | `resuelto` | `descartado`), `resolved_by`, `resolved_at`, `review_seconds` (para la métrica de tiempo de revisión).
+**`review_items`**, la bandeja de revisión (la ve quien tiene `review` o `match`): `kind` (`lectura` | `proveedor_nuevo` | `equivalencia_nueva` | `cruce_propuesto` | `pago_propuesto`), `document_id` / `bank_movement_id` / `match_id` (los que apliquen), `reason`, `status` (`abierto` | `resuelto` | `descartado`), `resolved_by`, `resolved_at`, `review_seconds` (para la métrica de tiempo de revisión).
 
 ### Banco
 
@@ -143,22 +156,24 @@ Todas las tablas son de una empresa: llevan `tenant_id`, RLS estándar, `created
 
 1. Toma los archivos `pendiente_lectura` y los marca `leyendo`. Después de 3 intentos fallidos, el archivo va a revisión.
 2. Llama a Claude con las páginas y un esquema JSON: tipo, proveedor (nombre y NIF), número, fechas, albaranes citados, dirección de entrega, líneas, desglose de IVA, totales, y una confianza por campo. El prompt está versionado en `lib/reading/prompt.ts`.
-3. Valida con `validateExtraction` (pura): suma de líneas = base (±`tolerance_sum_eur`), base + IVA + recargo = total, tipos de IVA válidos, NIF válido, fecha entre hoy −400 días y hoy +5, y duplicado por (proveedor, tipo, número).
+3. Valida con `validateExtraction` (pura): suma de líneas = base (±`tolerance_sum_eur`), base + IVA + recargo = total, total − retención = líquido a pagar, tipo de retención válido, tipos de IVA válidos, NIF válido, fecha entre hoy −400 días y hoy +5, y duplicado por (proveedor, tipo, número).
 4. Normaliza: proveedor por NIF y, si no hay, por nombre aproximado contra `legal_name`/`trade_name`. Las líneas se resuelven con las equivalencias y el local sale de la tablet o de la dirección de entrega.
 5. Decide el destino: con todo validado y confianza alta, `read_status = leido` y pasa a cruces. Si no, `a_revisar` y se crea un `review_item`. Un archivo ilegible queda `rechazado` con su motivo (`borroso`, `cortado`, `faltan_paginas`, `mezclados`, `no_es_compra`, `pdf_danado`).
 6. Un proveedor o una equivalencia desconocidos crean `review_items` (`proveedor_nuevo`, `equivalencia_nueva`). El documento no entra al cruce línea a línea hasta resolverlos, pero sí al cruce de pagos por total.
 
-### 7.3 Importación del extracto (`operador`)
+### 7.3 Importación del extracto (`bank_import`)
 
-1. Basal sube el Excel de Santander. El parser (`lib/bank/santander.ts`, puro) busca la fila de encabezados ("Fecha Operación", "Concepto", "Importe", "Saldo") y no depende de una fila fija.
+1. Un usuario con `bank_import` sube el Excel de Santander. El parser (`lib/bank/santander.ts`, puro) busca la fila de encabezados ("Fecha Operación", "Concepto", "Importe", "Saldo") y no depende de una fila fija.
 2. Cada fila genera un `row_hash`, y las que ya existen se cuentan como duplicadas y no se cargan.
-3. `classifyMovement` (pura) deduce el tipo por el código y el texto ("Recibo …", "Transferencia A Favor De …", "Transaccion Contactless En …", "Compra …"), extrae la contraparte y la clasifica como `no_proveedor` si es sueldo, TGSS, impuesto, efectivo, Square u otro movimiento interno, con una lista configurable. Lo demás se busca contra `suppliers.bank_aliases`.
+3. `classifyMovement` (pura) deduce el tipo por el código y el texto ("Recibo …", "Transferencia A Favor De …", "Transaccion Contactless En …", "Compra …"), extrae la contraparte y la clasifica como `no_proveedor` si no lleva factura de proveedor: sueldos, TGSS, impuestos (incluidos los modelos 111 y 115), efectivo, Square u otros movimientos internos, con una lista configurable. Alquiler, gestoría, suministros y obras **sí** son proveedores. Lo demás se busca contra `suppliers.bank_aliases`.
 
 ### 7.4 Cruce factura ↔ pago (`matchPayments`, pura)
 
 Entradas: facturas y abonos con saldo pendiente, movimientos de proveedor sin conciliar y la configuración. Para cada movimiento:
 
-1. **Exacto:** mismo proveedor, importe igual al total de una factura (±0,01 €) y fecha dentro de [`doc_date` − 3, `due_date` + `payment_window_days`]. Confianza 0,95.
+Todos los importes del cruce usan `payable_total` (lo que efectivamente se le paga al proveedor), no `total`.
+
+1. **Exacto:** mismo proveedor, importe igual al líquido a pagar de una factura (±0,01 €) y fecha dentro de [`doc_date` − 3, `due_date` + `payment_window_days`]. Confianza 0,95.
 2. **Agrupado:** mismo proveedor, y una combinación de 2 a 6 facturas pendientes que suma el importe (subset-sum acotado, priorizando las más antiguas). Confianza 0,85.
 3. **Parcial:** el importe es menor que el de una única factura pendiente del proveedor. Se propone como pago parcial, con confianza 0,6.
 4. **Tarjeta:** se cruza con `factura_simplificada` o `factura` del mismo proveedor y la misma fecha (±1 día) por importe exacto.
@@ -169,6 +184,8 @@ Con confianza ≥ 0,9 el cruce se confirma solo; entre 0,6 y 0,9 queda `propuest
 `payment_status` se recalcula desde los vínculos. `vencida` se calcula al consultar, nunca se guarda.
 
 ### 7.5 Cruce albarán ↔ factura (`matchDeliveries`, pura)
+
+Solo para facturas de proveedores con `uses_delivery_notes = true`. Las demás quedan en `match_status = no_aplica` y solo cruzan con el pago.
 
 1. **Candidatos:** los albaranes citados en `referenced_delivery_numbers`. Si la factura no cita ninguno, los albaranes del mismo proveedor sin factura entre la fecha del albarán más antiguo probable y `doc_date`, sin límite fijo de días. Si un número citado no existe, se crea la incidencia `falta_albaran` y se cruza con los que sí están.
 2. **Agregación:** se suman las líneas de los albaranes por `supply_item_id` (o por `supplier_code` o descripción normalizada si no hay equivalencia), en unidad base.
@@ -186,9 +203,13 @@ Al confirmar el cruce de una factura (o al leerla, si el proveedor no manda alba
 
 ### 7.7 Incidencias
 
-Ciclo: `abierta` → `en_revision` (Basal confirma o descarta como `error_lectura`) → `reclamo_preparado` → `aprobada` (solo `dueno`) → `enviada` (registra quién y cuándo) → `cerrada`, por abono vinculado, factura corregida o diferencia aceptada por el Dueño. Un abono leído se propone automáticamente para cerrar las incidencias abiertas del mismo proveedor con importe compatible. La v1 no envía mails: el texto del reclamo se copia y se manda por fuera.
+Ciclo: `abierta` → `en_revision` (un usuario con `incidents` confirma o descarta como `error_lectura`) → `reclamo_preparado` → `aprobada` (solo `incidents_approve`; si la separación de funciones está activa, no puede aprobar quien preparó el reclamo) → `enviada` (registra quién y cuándo) → `cerrada`, por abono vinculado, factura corregida o diferencia aceptada por un aprobador. Un abono leído se propone automáticamente para cerrar las incidencias abiertas del mismo proveedor con importe compatible. La v1 no envía mails: el texto del reclamo se copia y se manda por fuera.
 
-### 7.8 Buzón (`/api/cron/mailbox`, cada 30 minutos)
+### 7.8 Retenciones
+
+Resumen trimestral de retenciones soportadas por proveedor y tipo, separado en profesionales (modelo 111) y arrendamientos (modelo 115), para el cierre y la gestoría.
+
+### 7.9 Buzón (`/api/cron/mailbox`, cada 30 minutos)
 
 Se conecta por IMAP con `imapflow`, abre la carpeta en modo solo lectura (EXAMINE), trae los mensajes con UID mayor que `last_uid`, descarta los remitentes internos y crea un `source_file` con `origin = mail` por cada adjunto PDF o imagen. Nunca marca, mueve ni borra mails.
 
@@ -196,17 +217,18 @@ Se conecta por IMAP con `imapflow`, abre la carpeta en modo solo lectura (EXAMIN
 
 Rutas bajo `app/(main)/`:
 
-| Ruta | Perfil | Contenido |
+| Ruta | Permiso | Contenido |
 |---|---|---|
-| `/capturar` | local (pantalla de inicio de la tablet) | Botón "Subir documento", cámara con varias páginas, "Llegó con diferencias" con nota, y la lista de lo subido hoy con su estado |
-| `/` | dueno, consulta, operador | Tarjetas de diferencias abiertas, pagos sin factura con el IVA en juego, facturas que vencen en 7 días y pendientes de revisión, con filtros por local y período |
-| `/documentos` y `/documentos/[id]` | todos menos local | Lista con filtros, y el detalle con la foto a la izquierda y datos, líneas, vínculos, incidencias e historial a la derecha |
-| `/revision` | operador | La bandeja de `review_items`, con el campo dudoso resaltado sobre la foto |
-| `/cruces` | todos menos local | Pestañas Pendientes / Con diferencia / Conciliadas, con la tabla línea a línea por factura |
-| `/pagos` | todos menos local | Movimientos con su factura y estado, "Facturas a pedir" por proveedor, pendientes y vencidas |
-| `/incidencias` | operador, dueno | Lista y detalle. El Dueño aprueba desde acá |
-| `/proveedores` | todos menos local | Por proveedor y mes: albaranes, facturado, diferencia, pagado y pendiente, más la evolución de precios |
-| `/configuracion/*` | operador | Locales, proveedores, insumos, equivalencias, cuentas bancarias, tolerancias, buzón y usuarios |
+| `/capturar` | `capture` (pantalla de inicio de la tablet) | Botón "Subir documento", cámara con varias páginas, "Llegó con diferencias" con nota, y la lista de lo subido hoy con su estado |
+| `/` | `view` | Tarjetas de diferencias abiertas, pagos sin factura con el IVA en juego, facturas que vencen en 7 días y pendientes de revisión, con filtros por local y período |
+| `/documentos` y `/documentos/[id]` | `view` (edita con `review`) | Lista con filtros, y el detalle con la foto a la izquierda y datos, líneas, vínculos, incidencias e historial a la derecha |
+| `/revision` | `review` | La bandeja de `review_items`, con el campo dudoso resaltado sobre la foto |
+| `/cruces` | `view` (confirma con `match`) | Pestañas Pendientes / Con diferencia / Conciliadas, con la tabla línea a línea por factura |
+| `/pagos` | `view` (importa con `bank_import`) | Movimientos con su factura y estado, "Facturas a pedir" por proveedor, pendientes y vencidas |
+| `/incidencias` | `incidents`, `incidents_approve` | Lista y detalle; aprueba quien tiene `incidents_approve` |
+| `/retenciones` | `view` | Retenciones del trimestre por proveedor, separadas por modelo 111 y 115, exportables |
+| `/proveedores` | `view` | Por proveedor y mes: albaranes, facturado, diferencia, pagado y pendiente, más la evolución de precios |
+| `/configuracion/*` | `masters`, `settings` | Locales, proveedores, insumos, equivalencias, cuentas bancarias, tolerancias, buzón y usuarios |
 
 Todas las tablas exportan a Excel con `exceljs`, igual que el ERP.
 
@@ -216,7 +238,7 @@ Solo se documentan con valores de ejemplo en `.env.example`; nunca van al reposi
 
 ## 10. Testing
 
-- **Funciones puras con casos exhaustivos:** `validateExtraction`, `nif`, `santander` (con un extracto real anonimizado), `classifyMovement`, `matchPayments` (exacto, agrupado, parcial, tarjeta, saldo a cuenta, pago doble), `matchDeliveries` (con y sin referencias, sin precio, unidades distintas, facturado no recibido, tolerancias en el límite) y `priceVariation`.
+- **Funciones puras con casos exhaustivos:** `validateExtraction` (incluidas facturas con retención), `nif`, `santander` (con un extracto real anonimizado), `classifyMovement`, `matchPayments` (exacto, agrupado, parcial, tarjeta, saldo a cuenta, pago doble, factura con retención), `matchDeliveries` (con y sin referencias, sin precio, unidades distintas, facturado no recibido, tolerancias en el límite) y `priceVariation`.
 - **Integración contra Postgres real:** RLS entre dos empresas en cada tabla nueva, captura con duplicado, lectura simulada (el cliente de Claude se inyecta como proveedor), importación de extracto con duplicados y el ciclo completo de una incidencia.
 - **Precisión de lectura:** un script que corre la lectura sobre la muestra de 20 documentos de octubre y la compara campo por campo contra un JSON verificado a mano. Mide precisión de cabecera, de líneas, el porcentaje sin revisión y el costo por documento.
 
@@ -235,7 +257,7 @@ Solo se documentan con valores de ejemplo en `.env.example`; nunca van al reposi
 | `price_history` | `item_cost_history` |
 | `incidents` | Tabla nueva en el ERP |
 
-Pendientes para la integración: la configuración de país por empresa en el ERP (España/Argentina), la conversión `Decimal` ↔ `Float` y el tipo de comprobante español en `DOCUMENT_TYPES`.
+Pendientes para la integración: la configuración de país por empresa en el ERP (España/Argentina), la conversión `Decimal` ↔ `Float`, el tipo de comprobante español en `DOCUMENT_TYPES`, las retenciones de IRPF en compras y **permisos por usuario a nivel de módulo y sección**, en lugar de perfiles fijos.
 
 ## 12. Entregas
 
@@ -246,15 +268,16 @@ Pendientes para la integración: la configuración de país por empresa en el ER
 | 3 | Lectura con IA, validación, bandeja de revisión, maestros de proveedores, insumos y equivalencias | Ver los datos leídos y corregir en la bandeja; medir la precisión con la muestra de octubre |
 | 4 | Importación del extracto de Santander y cruce factura ↔ pago | Cargar septiembre y octubre y ver los pagos sin factura |
 | 5 | Cruce albarán ↔ factura e incidencias con aprobación | El ciclo completo de una diferencia, de la detección al cierre |
-| 6 | Inicio, proveedores, alertas de precio y exportaciones | El tablero para Robbie y Juampo |
+| 6 | Inicio, proveedores, alertas de precio y exportaciones | El tablero para quienes consultan |
 | 7 | Buzón IMAP de info@natif.es | Las facturas por mail entran solas |
 
 **Fuera de la v1:** WhatsApp, conexión bancaria directa (PSD2), cuenta PGC por factura para el cierre mensual, albaranes internos entre locales, escandallos con precio real, proyección de caja, pedidos y P&G por local.
 
 ## 13. Preguntas abiertas
 
-1. Quién envía el reclamo al proveedor: el Dueño, o Basal en nombre de Natif.
-2. La credencial IMAP de solo lectura de info@natif.es (GoDaddy).
-3. Confirmar que las tablets no son la caja de Square.
-4. Cómo funciona el saldo a cuenta con Euceco.
-5. Validar las tolerancias iniciales (§6, `tenant_settings`).
+1. Quién envía el reclamo al proveedor: el aprobador, o el operador en nombre de la empresa.
+2. Separación de funciones: si el sistema debe impedir que una misma persona prepare y apruebe el mismo reclamo (se propone como opción por empresa, activada por defecto).
+3. La credencial IMAP de solo lectura de info@natif.es (GoDaddy).
+4. Confirmar que las tablets no son la caja de Square.
+5. Cómo funciona el saldo a cuenta con Euceco.
+6. Validar las tolerancias iniciales (§6, `tenant_settings`).
